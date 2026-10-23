@@ -9,31 +9,48 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const sharedDirectory = path.dirname(fileURLToPath(import.meta.url));
-const scriptDirectory = process.env.QA_PROJECT_TOOLS;
 const geolocationHolderPath = path.join(sharedDirectory, 'hold-chrome-geolocation.mjs');
-const browserSessionCheckpointHarnessPath = process.env.QA_BROWSER_FIXTURE_HARNESS;
-const configurationPath = process.env.QA_BROWSER_SESSION_CONFIG;
-if (!scriptDirectory || !browserSessionCheckpointHarnessPath || !configurationPath) {
-  throw new Error('Use the project launcher, or supply QA_PROJECT_TOOLS, QA_BROWSER_FIXTURE_HARNESS and QA_BROWSER_SESSION_CONFIG.');
+const rawArguments = process.argv.slice(2);
+const configIndex = rawArguments.indexOf('--config');
+const configArgument = rawArguments.find(argument => argument.startsWith('--config='));
+const configuredPath = configIndex >= 0 ? rawArguments[configIndex + 1]
+  : configArgument?.slice('--config='.length) || process.env.QA_BROWSER_BASE_CONFIG || process.env.QA_BROWSER_SESSION_CONFIG;
+if (!configuredPath || configuredPath.startsWith('--')) {
+  fail('Usage: myscoutee-qa-browser --config PROJECT_CONFIG CHECKPOINT_ID');
 }
-const chromeBinary = process.env.CHROME_BIN || '/opt/google/chrome/chrome';
-const argumentsList = process.argv.slice(2);
+const baseConfigurationPath = path.resolve(configuredPath);
+const baseConfiguration = JSON.parse(await readFile(baseConfigurationPath, 'utf8'));
+const configurationPath = path.resolve(process.env.QA_BROWSER_SESSION_CONFIG || baseConfigurationPath);
+const configuration = configurationPath === baseConfigurationPath
+  ? baseConfiguration : JSON.parse(await readFile(configurationPath, 'utf8'));
+const launcher = baseConfiguration.launcher;
+if (!launcher?.projectRoot || !launcher.fixtureHarness || !launcher.runtimeNamespace) {
+  fail('Configure launcher.projectRoot, fixtureHarness and runtimeNamespace in the project config.');
+}
+const projectRoot = path.resolve(path.dirname(baseConfigurationPath), launcher.projectRoot);
+const harnessMode = process.env[launcher.fixtureHarness.modeEnvironment];
+const harness = launcher.fixtureHarness.modes?.[harnessMode] || launcher.fixtureHarness.default;
+const browserSessionCheckpointHarnessPath = process.env.QA_BROWSER_FIXTURE_HARNESS || path.resolve(projectRoot, harness);
+const deviceHelper = launcher.deviceHelper && path.resolve(projectRoot, launcher.deviceHelper);
+const preflightHelper = launcher.preflightHelper && path.resolve(projectRoot, launcher.preflightHelper);
+const application = configuration.application ?? baseConfiguration.application;
+if (!application?.storage || !application.routes || !application.headers
+    || !application.selectors || !application.fixture) {
+  fail('The project browser configuration must supply application storage, routes, headers, selectors and fixture commands.');
+}
+const argumentsList = rawArguments.filter((argument, index) =>
+  index !== configIndex && (configIndex < 0 || index !== configIndex + 1) && argument !== configArgument);
+const chromeBinary = process.env.CHROME_BIN || launcher.chromeBinary || '/opt/google/chrome/chrome';
 const headless = argumentsList.includes('--headless');
 const closeOnly = argumentsList.includes('--close-only');
 const dismissGuidesOnly = argumentsList.includes('--dismiss-guides');
 const verifyExistingOnly = argumentsList.includes('--verify-existing');
-const reopenActor = argumentsList.find(argument => argument.startsWith('--reopen-actor='))?.split('=')[1];
+const reopenActor = argumentsList.find(argument => argument.startsWith('--reopen-actor='))?.slice('--reopen-actor='.length);
 const checkpointId = `${argumentsList.find(argument => !argument.startsWith('--')) || process.env.QA_CHECKPOINT || ''}`.trim();
-const runtimeRoot = path.join(os.tmpdir(), process.env.QA_BROWSER_RUNTIME_NAMESPACE || 'qa-browser-sessions');
+const runtimeRoot = path.join(os.tmpdir(), process.env.QA_BROWSER_RUNTIME_NAMESPACE || launcher.runtimeNamespace);
+if (!checkpointId) fail('Usage: myscoutee-qa-browser --config PROJECT_CONFIG CHECKPOINT_ID');
+if (!existsSync(chromeBinary)) fail(`Chrome is not executable at ${chromeBinary}`);
 
-if (!checkpointId) {
-  fail('Usage: open-checkpoint-browser-sessions.mjs CHECKPOINT_ID');
-}
-if (!existsSync(chromeBinary)) {
-  fail(`Chrome is not executable at ${chromeBinary}`);
-}
-
-const configuration = JSON.parse(await readFile(configurationPath, 'utf8'));
 const checkpoint = configuration.checkpoints?.[checkpointId];
 if (!checkpoint || !Array.isArray(checkpoint.sessions) || checkpoint.sessions.length === 0) {
   fail(`No browser-session configuration exists for ${checkpointId}`);
@@ -41,16 +58,19 @@ if (!checkpoint || !Array.isArray(checkpoint.sessions) || checkpoint.sessions.le
 
 // Fixture readiness is verified before any existing managed session is replaced.
 if (checkpoint.fixtureScenario && checkpoint.device !== 'android') {
-  const baseline = await runAttachedCommand('bash', [browserSessionCheckpointHarnessPath,
-    'ready', checkpoint.fixtureScenario, checkpoint.fixtureCheckpointId || checkpointId], process.env);
+  const baseline = await runAttachedCommand(application.fixture.executable, [browserSessionCheckpointHarnessPath,
+    application.fixture.readyAction, checkpoint.fixtureScenario, checkpoint.fixtureCheckpointId || checkpointId], process.env);
   const result = JSON.parse(baseline.stdout);
   if (result.checkpointId !== (checkpoint.fixtureCheckpointId || checkpointId)
       || result.phase !== checkpoint.fixtureReadyPhase) fail('The configured browser fixture is not ready.');
 }
 
-const defaults = configuration.defaults ?? {};
-const defaultTargetUrl = `${checkpoint.targetUrl || defaults.targetUrl || 'http://localhost/game'}`;
-const defaultEntryUrl = `${checkpoint.entryUrl || defaults.entryUrl || 'http://localhost/entry?redirect=%2Fgame'}`;
+const defaults = { ...baseConfiguration.defaults, ...configuration.defaults };
+const defaultTargetUrl = `${checkpoint.targetUrl || defaults.targetUrl}`;
+const defaultEntryUrl = `${checkpoint.entryUrl || defaults.entryUrl}`;
+if (!checkpoint.targetUrl && !defaults.targetUrl || !checkpoint.entryUrl && !defaults.entryUrl) {
+  fail('Configure entryUrl and targetUrl in the project defaults or checkpoint.');
+}
 const configuredAppOrigins = new Set([
   defaultEntryUrl, defaultTargetUrl,
   ...checkpoint.sessions.flatMap(session => [
@@ -60,15 +80,12 @@ const configuredAppOrigins = new Set([
   const origin = new URL(url).origin;
   return [origin, origin.replace('http:', 'https:')];
 }));
-const storageScope = `${checkpoint.storageScope || defaults.storageScope || 'http'}`.trim();
+const storageScope = `${checkpoint.storageScope || defaults.storageScope || ''}`.trim();
 const bootstrapEntryConsent = checkpoint.bootstrapEntryConsent
   ?? defaults.bootstrapEntryConsent
   ?? true;
-const defaultGeolocation = checkpoint.geolocation ?? defaults.geolocation ?? {
-  latitude: 30.2672,
-  longitude: -97.7431,
-  accuracy: 10
-};
+const defaultGeolocation = checkpoint.geolocation ?? defaults.geolocation;
+if (!defaultGeolocation || !storageScope) fail('Configure project geolocation and storageScope.');
 const screenWidth = positiveInteger(process.env.QA_SCREEN_WIDTH, defaults.screenWidth ?? 1920);
 const screenHeight = positiveInteger(process.env.QA_SCREEN_HEIGHT, defaults.screenHeight ?? 1000);
 const columns = Math.min(
@@ -90,8 +107,8 @@ if (checkpoint.device === 'android') {
   let baseline;
   if (checkpoint.fixtureScenario) {
     if (!checkpoint.fixtureCheckpointId || !checkpoint.fixtureReadyPhase) fail('Configure the fixture checkpoint and ready phase.');
-    const result = await runAttachedCommand('bash', [browserSessionCheckpointHarnessPath,
-      'ready', checkpoint.fixtureScenario, checkpoint.fixtureCheckpointId], process.env);
+    const result = await runAttachedCommand(application.fixture.executable, [browserSessionCheckpointHarnessPath,
+      application.fixture.readyAction, checkpoint.fixtureScenario, checkpoint.fixtureCheckpointId], process.env);
     baseline = JSON.parse(result.stdout);
     if (baseline.checkpointId !== checkpoint.fixtureCheckpointId || baseline.phase !== checkpoint.fixtureReadyPhase) {
       fail('The configured phone fixture is not ready.');
@@ -101,9 +118,10 @@ if (checkpoint.device === 'android') {
     const statusPath = process.env.QA_DEPLOY_FIXTURE_STATUS;
     if (!statusPath) fail('Verify the configured deployment fixture and provide QA_DEPLOY_FIXTURE_STATUS.');
     baseline = JSON.parse(await readFile(statusPath, 'utf8'));
-    const authenticationReady = process.env.QA_DEPLOY_ALLOW_DEMO === 'true' && checkpoint.authenticationMode === 'demo'
-      ? baseline.demoActive === true : baseline.firebaseActive === true;
-    if (baseline.checkpointId !== checkpointId || baseline.phase !== 'baseline-ready'
+    const readinessField = application.fixture.authenticationReadyFields[
+      checkpoint.authenticationMode || application.fixture.defaultAuthenticationMode];
+    const authenticationReady = typeof readinessField === 'string' && baseline[readinessField] === true;
+    if (baseline.checkpointId !== checkpointId || baseline.phase !== application.fixture.deploymentReadyPhase
       || !authenticationReady || Date.now() - Date.parse(baseline.checkedAt) > 300000
       || !Number.isFinite(Date.parse(baseline.checkedAt))) {
       fail('A current verified configured-deployment baseline is required.');
@@ -119,7 +137,7 @@ if (checkpoint.device === 'android') {
     process.exit(0);
   }
   const url = new URL(defaultEntryUrl);
-  await runAttachedCommand(process.execPath, [path.join(scriptDirectory, 'mobile-webview-device.mjs'),
+  await runAttachedCommand(process.execPath, [deviceHelper,
     'launch-browser', url.pathname + url.search], {...process.env, QA_PHONE_ORIGIN: url.origin});
   await writeFile(manifestPath, JSON.stringify({checkpointId, device: 'android', createdAt: new Date().toISOString(),
     origin: url.origin, fixtureCheckedAt: baseline.checkedAt,
@@ -161,7 +179,7 @@ const manifest = {
 try {
   for (const [index, session] of checkpoint.sessions.entries()) {
     validateSession(session);
-    const sessionKind = `${session.sessionKind ?? 'demo'}`.trim().toLowerCase();
+    const sessionKind = `${session.sessionKind ?? defaults.sessionKind}`.trim().toLowerCase();
     const targetUrl = `${session.targetUrl || defaultTargetUrl}`;
     const entryUrl = `${session.entryUrl || defaultEntryUrl}`;
     const actorSlug = `${session.actor}`.toLowerCase().replace(/[^a-z0-9]+/g, '-');
@@ -199,7 +217,7 @@ try {
       '--no-default-browser-check',
       '--disable-session-crashed-bubble',
       '--hide-crash-restore-bubble',
-      ...((checkpoint.ignoreCertificateErrors ?? defaults.ignoreCertificateErrors ?? true)
+      ...((checkpoint.ignoreCertificateErrors ?? defaults.ignoreCertificateErrors ?? false)
         ? ['--ignore-certificate-errors'] : []),
       ...(checkpoint.hostResolverRules
         ? [`--host-resolver-rules=${checkpoint.hostResolverRules}`] : []),
@@ -285,10 +303,10 @@ try {
     await persistManifest();
     process.stdout.write(`${session.actor}: ${session.expectedName} ready.\n`);
   }
-  if (checkpoint.startupOracle === 'ui-poll') {
+  if (checkpoint.startupOracle) {
     await runAttachedCommand(process.execPath,
-      [path.join(scriptDirectory, 'verify-ui-poll-sessions.mjs'), 'preflight', manifestPath], process.env);
-    process.stdout.write('UI-POLL-JANK-001: three identities, Group Chat visibility and exactly two Casey sessions verified.\n');
+      [preflightHelper, 'preflight', manifestPath], process.env);
+    process.stdout.write(`${checkpointId}: configured startup preflight passed.\n`);
   }
 } catch (error) {
   try {
@@ -316,7 +334,7 @@ async function prepareConfiguredDemoSessions() {
   const userIds = [...new Set([
     ...(checkpoint.additionalDemoUserIds || []),
     ...checkpoint.sessions
-      .filter(session => `${session.sessionKind ?? 'demo'}`.trim().toLowerCase() === 'demo')
+      .filter(session => `${session.sessionKind ?? defaults.sessionKind}`.trim().toLowerCase() === 'demo')
       .map(session => `${session.userId ?? ''}`.trim())
       .filter(Boolean)
   ])];
@@ -325,13 +343,13 @@ async function prepareConfiguredDemoSessions() {
     throw new Error(`Browser-session checkpoint harness is missing at ${browserSessionCheckpointHarnessPath}.`);
   }
   const result = await runAttachedCommand(
-    'bash',
+    application.fixture.executable,
     // A companion actor uses the same fixture snapshot without replacing the
     // ongoing participant windows (for example app-admin moderation).
-    [browserSessionCheckpointHarnessPath, 'prepare', 'browser-sessions', checkpoint.fixtureCheckpointId || checkpointId],
+    [browserSessionCheckpointHarnessPath, application.fixture.prepareAction, application.fixture.browserScenario, checkpoint.fixtureCheckpointId || checkpointId],
     {
       ...process.env,
-      MANUAL_QA_BROWSER_USER_IDS: userIds.join(',')
+      [application.fixture.userIdsEnvironment]: userIds.join(',')
     }
   );
   if (result.stdout) process.stdout.write(result.stdout);
@@ -341,6 +359,7 @@ async function prepareConfiguredDemoSessions() {
 async function runAttachedCommand(executable, args, env) {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
+      cwd: projectRoot,
       env,
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -382,7 +401,7 @@ async function reopenManagedActor(actor) {
     ...(existing.headless === true ? ['--headless=new'] : []),
     `--user-data-dir=${retained.userDataDirectory}`, '--remote-debugging-port=0', '--no-first-run',
     '--no-default-browser-check', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble',
-    ...((checkpoint.ignoreCertificateErrors ?? defaults.ignoreCertificateErrors ?? true) ? ['--ignore-certificate-errors'] : []),
+    ...((checkpoint.ignoreCertificateErrors ?? defaults.ignoreCertificateErrors ?? false) ? ['--ignore-certificate-errors'] : []),
     ...(checkpoint.hostResolverRules ? [`--host-resolver-rules=${checkpoint.hostResolverRules}`] : []),
     '--ozone-platform=x11', `--window-position=${position.x},${position.y}`, `--window-size=${position.width},${position.height}`,
     ...(configured.fakeMediaStream === true ? ['--use-fake-device-for-media-stream'] : []),
@@ -426,7 +445,7 @@ async function verifyExistingManagedSessions(filePath) {
     const userId = `${session.userId ?? ''}`.trim();
     const sessionId = `${session.sessionId ?? ''}`.trim();
     const configuredSession = checkpoint.sessions.find(item => item.userId === userId);
-    const targetUrl = `${configuredSession?.targetUrl || checkpoint.targetUrl || defaults.targetUrl || 'http://localhost/game'}`;
+    const targetUrl = `${configuredSession?.targetUrl || checkpoint.targetUrl || defaults.targetUrl}`;
     if (!Number.isInteger(port) || port <= 0 || !userId || !sessionId) {
       throw new Error(`Managed browser-session state for ${userId || 'unknown user'} is incomplete.`);
     }
@@ -439,12 +458,18 @@ async function verifyExistingManagedSessions(filePath) {
       }
     }
     session.readinessVerifiedAt = new Date().toISOString();
-    process.stdout.write(`${session.actor}: /auth/me and realtime ready.\n`);
+    process.stdout.write(`${session.actor}: configured identity and realtime endpoints ready.\n`);
   }
   existing.readinessVerifiedAt = new Date().toISOString();
   await writeFile(filePath, `${JSON.stringify(existing, null, 2)}\n`, { mode: 0o600 });
   await chmod(filePath, 0o600);
   process.stdout.write(`${checkpointId}: all managed sessions passed the final readiness gate.\n`);
+}
+
+function storageKey(name, scope) {
+  const pattern = application.storage[name];
+  if (typeof pattern !== 'string' || !pattern) throw new Error(`Missing configured storage key: ${name}`);
+  return pattern.replaceAll('{scope}', scope);
 }
 
 function positiveInteger(raw, fallback) {
@@ -469,7 +494,7 @@ function normalizeMicrophonePermission(raw) {
 }
 
 function validateSession(session) {
-  const sessionKind = `${session?.sessionKind ?? 'demo'}`.trim().toLowerCase();
+  const sessionKind = `${session?.sessionKind ?? defaults.sessionKind}`.trim().toLowerCase();
   const validKind = ['demo', 'anonymous', 'operator-bootstrap'].includes(sessionKind);
   const hasRequiredIdentity = sessionKind === 'anonymous' || (sessionKind === 'operator-bootstrap' && !!process.env[session.credentialFileEnvironment])
     || Boolean(`${session?.userId ?? ''}`.trim());
@@ -660,9 +685,9 @@ async function installOperatorSession(port, scope, session, destinationUrl) {
   if (typeof credential.email !== 'string' || typeof credential.password !== 'string') {
     throw new Error('Operator credential file is incomplete.');
   }
-  const prefix = `myscoutee.${scope}.operator-bootstrap`;
+  const prefix = storageKey('operatorPrefix', scope);
   const result = await evaluateInOnlyPage(port, `(async () => {
-    const response = await fetch('/api/auth/operator-bootstrap', {
+    const response = await fetch(${JSON.stringify(application.routes.operatorLogin)}, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(${JSON.stringify({email: credential.email, password: credential.password})})
     });
@@ -680,8 +705,8 @@ async function installOperatorSession(port, scope, session, destinationUrl) {
   await evaluateInOnlyPage(port, `window.location.replace(${JSON.stringify(destinationUrl)})`, true);
   await waitUntil(async () => {
     try {
-      return await evaluateInOnlyPage(port, `location.pathname === '/operator'
-        && !!document.querySelector('app-operator-page')
+      return await evaluateInOnlyPage(port, `location.pathname === ${JSON.stringify(application.routes.operatorPage)}
+        && !!document.querySelector(${JSON.stringify(application.selectors.operatorPage)})
         && !!sessionStorage.getItem(${JSON.stringify(prefix + '.token.v1')})`);
     } catch { return false; }
   }, 30000, 'Operator page ready');
@@ -692,14 +717,14 @@ async function registerTrackedDemoSession(port, userId) {
   const attemptId = `attempt:${randomUUID()}`;
   const result = await evaluateInOnlyPage(port, `(async () => {
     try {
-      const response = await fetch('/api/auth/session/login', {
+      const response = await fetch(${JSON.stringify(application.routes.login)}, {
         method: 'POST',
         cache: 'no-store',
         headers: {
           'Content-Type': 'application/json',
-          'X-App-Session-Id': ${JSON.stringify(sessionId)},
-          'X-App-Session-Kind': 'demo',
-          'X-Demo-User-Id': ${JSON.stringify(userId)}
+          ${JSON.stringify(application.headers.sessionId)}: ${JSON.stringify(sessionId)},
+          ${JSON.stringify(application.headers.sessionKind)}: 'demo',
+          ${JSON.stringify(application.headers.userId)}: ${JSON.stringify(userId)}
         },
         body: JSON.stringify({
           attemptId: ${JSON.stringify(attemptId)},
@@ -738,13 +763,13 @@ async function revokeTrackedDemoSession(session) {
   if (`${session?.sessionKind ?? ''}` !== 'demo' || !sessionId || !userId || !sessionOrigin) {
     return;
   }
-  const response = await fetch(new URL('/api/auth/me/logout', sessionOrigin), {
+  const response = await fetch(new URL(application.routes.logout, sessionOrigin), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-App-Session-Id': sessionId,
-      'X-App-Session-Kind': 'demo',
-      'X-Demo-User-Id': userId
+      [application.headers.sessionId]: sessionId,
+      [application.headers.sessionKind]: 'demo',
+      [application.headers.userId]: userId
     },
     body: JSON.stringify({ userId })
   });
@@ -759,8 +784,8 @@ async function revokeTrackedDemoSession(session) {
 }
 
 async function installDemoSession(port, scope, userId, sessionId, destinationUrl, configuredLocalStorage) {
-  const sessionKey = `myscoutee.${scope}.session.v1`;
-  const activeUserKey = `myscoutee.${scope}.demo.active-user.v1`;
+  const sessionKey = storageKey('session', scope);
+  const activeUserKey = storageKey('activeUser', scope);
   const sessionValue = JSON.stringify({ kind: 'demo', userId, sessionId });
   const localStorageEntries = normalizeLocalStorageEntries(configuredLocalStorage);
   const expression = `(() => {
@@ -776,8 +801,8 @@ async function installDemoSession(port, scope, userId, sessionId, destinationUrl
 }
 
 async function clearManagedSession(port, scope, configuredLocalStorage) {
-  const sessionKey = `myscoutee.${scope}.session.v1`;
-  const activeUserKey = `myscoutee.${scope}.demo.active-user.v1`;
+  const sessionKey = storageKey('session', scope);
+  const activeUserKey = storageKey('activeUser', scope);
   const localStorageEntries = normalizeLocalStorageEntries(configuredLocalStorage);
   await evaluateInOnlyPage(port, `(() => {
     for (const [key, value] of ${JSON.stringify(localStorageEntries)}) {
@@ -852,7 +877,7 @@ async function prepareBrowserLocation(port, entryPageUrl, location, permission, 
 }
 
 async function acceptEntryConsent(port, scope, destinationUrl) {
-  const consentKey = `myscoutee.${scope}.entry.gdpr-consent.v1`;
+  const consentKey = storageKey('consent', scope);
   const destinationPath = new URL(destinationUrl).pathname;
   await waitUntil(async () => {
     try {
@@ -861,9 +886,9 @@ async function acceptEntryConsent(port, scope, destinationUrl) {
         const raw = localStorage.getItem(${JSON.stringify(consentKey)});
         const consent = raw ? JSON.parse(raw) : null;
         if (consent?.accepted === true) return true;
-        const footer = document.querySelector('.document-viewer-actions');
+        const footer = document.querySelector(${JSON.stringify(application.selectors.consentActions)});
         if (!footer) return false;
-        const buttons = Array.from(footer.querySelectorAll('button:not([disabled])'));
+        const buttons = Array.from(footer.querySelectorAll(${JSON.stringify(application.selectors.consentButton)}));
         const accept = buttons.at(-1);
         if (!accept) return false;
         accept.click();
@@ -899,16 +924,16 @@ async function acceptEntryConsent(port, scope, destinationUrl) {
 }
 
 async function acceptEntryConsentOnCurrentEntry(port, scope) {
-  const consentKey = `myscoutee.${scope}.entry.gdpr-consent.v1`;
+  const consentKey = storageKey('consent', scope);
   await waitUntil(async () => {
     try {
       return await evaluateInOnlyPage(port, `(() => {
         const raw = localStorage.getItem(${JSON.stringify(consentKey)});
         const consent = raw ? JSON.parse(raw) : null;
         if (consent?.accepted === true) return true;
-        const footer = document.querySelector('.document-viewer-actions');
+        const footer = document.querySelector(${JSON.stringify(application.selectors.consentActions)});
         if (!footer) return false;
-        const buttons = Array.from(footer.querySelectorAll('button:not([disabled])'));
+        const buttons = Array.from(footer.querySelectorAll(${JSON.stringify(application.selectors.consentButton)}));
         const accept = buttons.at(-1);
         if (!accept) return false;
         accept.click();
@@ -924,9 +949,9 @@ async function dismissExplanationGuide(port) {
   await waitUntil(async () => {
     try {
       return await evaluateInOnlyPage(port, `(() => {
-        const guide = document.querySelector('app-explanation-popup .ui-popup');
+        const guide = document.querySelector(${JSON.stringify(application.selectors.guide)});
         if (!guide) return true;
-        const button = guide.querySelector('button.ui-popup__close:not([disabled])');
+        const button = guide.querySelector(${JSON.stringify(application.selectors.guideClose)});
         if (!button) return false;
         button.click();
         return false;
@@ -938,7 +963,7 @@ async function dismissExplanationGuide(port) {
 }
 
 async function waitForConfiguredSession(port, scope, userId, sessionId, destinationUrl) {
-  const sessionKey = `myscoutee.${scope}.session.v1`;
+  const sessionKey = storageKey('session', scope);
   const expectedPath = new URL(destinationUrl).pathname;
   await waitUntil(async () => {
     let value;
@@ -950,13 +975,13 @@ async function waitForConfiguredSession(port, scope, userId, sessionId, destinat
         let realtime = { status: 0, userId: '', hasCounters: false };
         try {
           const response = await fetch(
-            '/api/auth/me?userId=' + encodeURIComponent(${JSON.stringify(userId)}),
+            ${JSON.stringify(application.routes.identity)} + encodeURIComponent(${JSON.stringify(userId)}),
             {
               cache: 'no-store',
               headers: {
-                'X-App-Session-Id': ${JSON.stringify(sessionId)},
-                'X-App-Session-Kind': 'demo',
-                'X-Demo-User-Id': ${JSON.stringify(userId)}
+                ${JSON.stringify(application.headers.sessionId)}: ${JSON.stringify(sessionId)},
+                ${JSON.stringify(application.headers.sessionKind)}: 'demo',
+                ${JSON.stringify(application.headers.userId)}: ${JSON.stringify(userId)}
               }
             }
           );
@@ -970,12 +995,12 @@ async function waitForConfiguredSession(port, scope, userId, sessionId, destinat
           // membership through the account-scoped workspace list, without
           // changing the user's saved selection during readiness checks.
           if (response.ok && authentication.userId && !authentication.belongsToAccount) {
-            const workspaceResponse = await fetch('/api/groups/workspaces?userId=' + encodeURIComponent(${JSON.stringify(userId)}), {
+            const workspaceResponse = await fetch(${JSON.stringify(application.routes.workspaces)} + encodeURIComponent(${JSON.stringify(userId)}), {
               cache: 'no-store',
               headers: {
-                'X-App-Session-Id': ${JSON.stringify(sessionId)},
-                'X-App-Session-Kind': 'demo',
-                'X-Demo-User-Id': ${JSON.stringify(userId)}
+                ${JSON.stringify(application.headers.sessionId)}: ${JSON.stringify(sessionId)},
+                ${JSON.stringify(application.headers.sessionKind)}: 'demo',
+                ${JSON.stringify(application.headers.userId)}: ${JSON.stringify(userId)}
               }
             });
             const workspaces = await workspaceResponse.json().catch(() => null);
@@ -983,14 +1008,14 @@ async function waitForConfiguredSession(port, scope, userId, sessionId, destinat
               && workspaces.some(workspace => workspace.profileId === authentication.userId
                 && workspace.membershipStatus === 'accepted');
           }
-          const realtimeResponse = await fetch('/api/auth/me/realtime/long-poll', {
+          const realtimeResponse = await fetch(${JSON.stringify(application.routes.realtime)}, {
             method: 'POST',
             cache: 'no-store',
             headers: {
               'Content-Type': 'application/json',
-              'X-App-Session-Id': ${JSON.stringify(sessionId)},
-              'X-App-Session-Kind': 'demo',
-              'X-Demo-User-Id': ${JSON.stringify(userId)}
+              ${JSON.stringify(application.headers.sessionId)}: ${JSON.stringify(sessionId)},
+              ${JSON.stringify(application.headers.sessionKind)}: 'demo',
+              ${JSON.stringify(application.headers.userId)}: ${JSON.stringify(userId)}
             },
             body: JSON.stringify({ userId: ${JSON.stringify(userId)}, cursor: null })
           });
@@ -1031,11 +1056,11 @@ async function waitForConfiguredSession(port, scope, userId, sessionId, destinat
       && value?.realtimeUserId === value?.authenticatedUserId
       && value?.realtimeHasCounters === true
       && value?.pathname === expectedPath;
-  }, 30000, `MyScoutee session ${userId} on DevTools port ${port}`);
+  }, 30000, `configured session ${userId} on DevTools port ${port}`);
 }
 
 async function waitForAnonymousEntry(port, scope, entryPageUrl) {
-  const sessionKey = `myscoutee.${scope}.session.v1`;
+  const sessionKey = storageKey('session', scope);
   const expectedPath = new URL(entryPageUrl).pathname;
   await waitUntil(async () => {
     try {
@@ -1047,7 +1072,7 @@ async function waitForAnonymousEntry(port, scope, entryPageUrl) {
     } catch {
       return false;
     }
-  }, 30000, `anonymous MyScoutee entry on DevTools port ${port}`);
+  }, 30000, `anonymous configured entry on DevTools port ${port}`);
 }
 
 async function evaluateInOnlyPage(port, expression, tolerateNavigation = false) {

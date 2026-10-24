@@ -1,0 +1,70 @@
+name: Release QA package
+
+on:
+  push:
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          registry-url: https://npm.pkg.github.com
+          scope: '@fssrepository'
+      - name: Verify tag and package identity
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFile } from 'node:fs/promises';
+          const pkg = JSON.parse(await readFile('package.json', 'utf8'));
+          assert.match(pkg.version, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+          assert.equal(process.env.GITHUB_REF_NAME, `v${pkg.version}`);
+          assert.equal(pkg.name, '@fssrepository/myscoutee-qa');
+          JS
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run check
+      - run: npm test
+      - run: npm run test:package
+      - name: Pack tested release
+        run: npm pack --pack-destination "$RUNNER_TEMP"
+      - name: Publish and verify registry artifact
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="$RUNNER_TEMP/fssrepository-myscoutee-qa-$version.tgz"
+          npm publish "$archive" --registry=https://npm.pkg.github.com
+          expected="$(node --input-type=module -e 'import { createHash } from "node:crypto"; import { readFileSync } from "node:fs"; console.log("sha512-" + createHash("sha512").update(readFileSync(process.argv[1])).digest("base64"))' "$archive")"
+          actual="$(npm view "@fssrepository/myscoutee-qa@$version" dist.integrity --registry=https://npm.pkg.github.com)"
+          [[ "$actual" == "$expected" ]]
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="$RUNNER_TEMP/fssrepository-myscoutee-qa-$version.tgz"
+          (cd "$RUNNER_TEMP" && sha256sum "$(basename "$archive")") > "$RUNNER_TEMP/SHA256SUMS"
+          {
+            printf 'Shared QA package **%s** for Node.js 22 or newer.\n\n' "$version"
+            printf 'Package: `@fssrepository/myscoutee-qa@%s`\n\n' "$version"
+            printf 'Registry: `https://npm.pkg.github.com`\n\nSource: `%s`\n\n' "$GITHUB_SHA"
+            printf 'Shared helper checks passed. Registry integrity matches the attached tarball.\n'
+          } > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$GITHUB_REF_NAME" "$archive" "$RUNNER_TEMP/SHA256SUMS" \
+            --verify-tag --title "MyScoutee QA $version" --notes-file "$RUNNER_TEMP/release-notes.md"

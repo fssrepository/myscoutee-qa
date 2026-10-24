@@ -1,0 +1,44 @@
+{
+  "name": "@fssrepository/myscoutee-qa",
+  "version": "1.5.0",
+  "description": "Shared MyScoutee manual-QA launchers, provider fixtures and matrix tools.",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fssrepository/myscoutee-qa.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    "./browser/launcher": "./browser/open-checkpoint-browser-sessions.mjs",
+    "./browser/geolocation": "./browser/hold-chrome-geolocation.mjs",
+    "./webhooks": "./webhooks/signed-webhook-receiver.mjs",
+    "./package.json": "./package.json",
+    "./mongo/kvm-fixture": "./mongo/kvm-fixture.py",
+    "./browser/manifest": "./browser/managed-browser-manifest.mjs"
+  },
+  "bin": {
+    "myscoutee-qa-browser": "./browser/open-checkpoint-browser-sessions.mjs"
+  },
+  "files": [
+    "browser/*.mjs",
+    "providers/*.py",
+    "mongo/*.py",
+    "webhooks/*.mjs",
+    "history/*.py",
+    "matrix/*.py",
+    "!**/*.test.mjs",
+    "!**/test_*.py"
+  ],
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test": "node --test webhooks/*.test.mjs && python3 -m unittest discover -s providers -p test_*.py && python3 -m unittest discover -s mongo -p test_*.py && python3 -m unittest discover -s browser -p test_*.py",
+    "test:package": "npm pack --dry-run --ignore-scripts",
+    "prepublishOnly": "npm run check && npm test"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  }
+}

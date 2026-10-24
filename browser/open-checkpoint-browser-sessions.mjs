@@ -267,8 +267,8 @@ try {
         await acceptEntryConsentOnCurrentEntry(port, storageScope);
       }
       await waitForAnonymousEntry(port, storageScope, entryUrl);
-    } else if (sessionKind === 'operator-bootstrap') {
-      await installOperatorSession(port, storageScope, session, targetUrl);
+    } else if (sessionKind === 'authenticated') {
+      await installAuthenticatedSession(port, storageScope, session, targetUrl);
       runtimeSession.authenticatedAt = new Date().toISOString();
     } else {
       runtimeSession.sessionId = await registerTrackedDemoSession(port, session.userId);
@@ -495,8 +495,8 @@ function normalizeMicrophonePermission(raw) {
 
 function validateSession(session) {
   const sessionKind = `${session?.sessionKind ?? defaults.sessionKind}`.trim().toLowerCase();
-  const validKind = ['demo', 'anonymous', 'operator-bootstrap'].includes(sessionKind);
-  const hasRequiredIdentity = sessionKind === 'anonymous' || (sessionKind === 'operator-bootstrap' && !!process.env[session.credentialFileEnvironment])
+  const validKind = ['demo', 'anonymous', 'authenticated'].includes(sessionKind);
+  const hasRequiredIdentity = sessionKind === 'anonymous' || (sessionKind === 'authenticated' && !!process.env[session.credentialFileEnvironment])
     || Boolean(`${session?.userId ?? ''}`.trim());
   if (!session || !`${session.actor ?? ''}`.trim() || !validKind || !hasRequiredIdentity) {
     throw new Error(`Invalid browser-session entry in ${checkpointId}`);
@@ -675,7 +675,7 @@ async function waitForDevToolsPort(userDataDirectory) {
   return port;
 }
 
-async function installOperatorSession(port, scope, session, destinationUrl) {
+async function installAuthenticatedSession(port, scope, session, destinationUrl) {
   const credentialPath = process.env[session.credentialFileEnvironment];
   const info = lstatSync(credentialPath);
   if (!info.isFile() || (info.mode & 0o077) !== 0) {
@@ -685,20 +685,20 @@ async function installOperatorSession(port, scope, session, destinationUrl) {
   if (typeof credential.email !== 'string' || typeof credential.password !== 'string') {
     throw new Error('Operator credential file is incomplete.');
   }
-  const prefix = storageKey('operatorPrefix', scope);
+  const sessionKey = storageKey('accountSession', scope);
+  const sessionId = `session:${randomUUID()}`;
+  const attemptId = `attempt:${randomUUID()}`;
   const result = await evaluateInOnlyPage(port, `(async () => {
-    const response = await fetch(${JSON.stringify(application.routes.operatorLogin)}, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(${JSON.stringify({email: credential.email, password: credential.password})})
+    const response = await fetch(${JSON.stringify(application.routes.login)}, {
+      method: 'POST', headers: { 'Content-Type': 'application/json',
+        ${JSON.stringify(application.headers.sessionId)}: ${JSON.stringify(sessionId)} },
+      body: JSON.stringify(${JSON.stringify({attemptId, provider: 'password', email: credential.email, password: credential.password})})
     });
     if (!response.ok) return { status: response.status, accepted: false };
     const body = await response.json();
-    if (body.tokenType !== 'OperatorBootstrap' || !body.accessToken
-        || Date.parse(body.expiresAt) <= Date.now()) return { accepted: false };
-    sessionStorage.setItem(${JSON.stringify(prefix + '.session.v1')}, JSON.stringify({
-      kind: 'operator-bootstrap', email: body.email, expiresAt: body.expiresAt
-    }));
-    sessionStorage.setItem(${JSON.stringify(prefix + '.token.v1')}, body.accessToken);
+    if (!body.accepted || !body.session?.accessToken || !body.session?.profile?.id
+        || Date.parse(body.session.expiresAt) <= Date.now()) return { accepted: false };
+    localStorage.setItem(${JSON.stringify(sessionKey)}, JSON.stringify({ kind: 'authenticated', ...body.session }));
     return { accepted: true };
   })()`);
   if (!result?.accepted) throw new Error(`Operator startup login failed (HTTP ${result?.status ?? 0}).`);
@@ -707,7 +707,7 @@ async function installOperatorSession(port, scope, session, destinationUrl) {
     try {
       return await evaluateInOnlyPage(port, `location.pathname === ${JSON.stringify(application.routes.operatorPage)}
         && !!document.querySelector(${JSON.stringify(application.selectors.operatorPage)})
-        && !!sessionStorage.getItem(${JSON.stringify(prefix + '.token.v1')})`);
+        && !!localStorage.getItem(${JSON.stringify(sessionKey)})`);
     } catch { return false; }
   }, 30000, 'Operator page ready');
 }

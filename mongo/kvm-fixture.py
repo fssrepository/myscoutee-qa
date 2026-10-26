@@ -39,7 +39,7 @@ class KvmMongo:
     def __init__(self, config):
         self.config = config
         self.namespace = config['namespace']
-        self.vm = (Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state')))
+        self.vm = (Path(os.environ.get('XDG_STATE_HOME', str(Path(os.environ.get('MYSCOUTEE_BACKEND_SOURCE', Path.cwd())) / '.local/state')))
                    / config['lab']['stateDirectory'] / 'vm')
         self.ip = str(ipaddress.ip_network(config['lab']['networkCidr'])[10])
 

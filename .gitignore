@@ -2,3 +2,6 @@ __pycache__/
 node_modules/
 .e2e-artifacts/
 /build/
+
+# Local credentials, private evidence and runtime state; never publish.
+/.local/
